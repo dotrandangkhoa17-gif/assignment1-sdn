@@ -2,17 +2,9 @@
 
 import Link from 'next/link';
 import { useState } from 'react';
-import { useAuth } from '@/contexts/AuthContext';
 
 export default function Navbar() {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
-  const { user, loading, logout } = useAuth();
-
-  const handleLogout = async () => {
-    await logout();
-    setIsMenuOpen(false);
-    window.location.href = '/';
-  };
 
   return (
     <nav className="navbar" id="main-navbar">
@@ -52,45 +44,6 @@ export default function Navbar() {
           >
             Teams
           </Link>
-
-          {!loading && (
-            <>
-              {user ? (
-                <div className="navbar-user" id="navbar-user">
-                  <div className="navbar-avatar" id="navbar-avatar">
-                    {user.name.charAt(0).toUpperCase()}
-                  </div>
-                  <span className="navbar-username">{user.name}</span>
-                  <button
-                    className="navbar-link navbar-logout-btn"
-                    id="nav-logout"
-                    onClick={handleLogout}
-                  >
-                    Logout
-                  </button>
-                </div>
-              ) : (
-                <div className="navbar-auth-links">
-                  <Link
-                    href="/login"
-                    className="navbar-link"
-                    id="nav-login"
-                    onClick={() => setIsMenuOpen(false)}
-                  >
-                    Login
-                  </Link>
-                  <Link
-                    href="/register"
-                    className="navbar-link navbar-register-btn"
-                    id="nav-register"
-                    onClick={() => setIsMenuOpen(false)}
-                  >
-                    Sign Up
-                  </Link>
-                </div>
-              )}
-            </>
-          )}
         </div>
       </div>
     </nav>
