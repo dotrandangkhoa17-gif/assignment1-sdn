@@ -49,6 +49,36 @@ export default function TaskList() {
     }
   };
 
+  const handleToggleStatus = async (id: string, newStatus: string) => {
+    // Optimistic update — update UI immediately
+    setTasks((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, status: newStatus } : t))
+    );
+
+    try {
+      const task = tasks.find((t) => t.id === id);
+      if (!task) return;
+
+      const res = await fetch(`/api/tasks/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: task.title,
+          description: task.description,
+          status: newStatus,
+          priority: task.priority,
+          dueDate: task.dueDate,
+        }),
+      });
+
+      if (!res.ok) throw new Error('Failed to update status');
+    } catch (error) {
+      console.error('Error updating task status:', error);
+      // Revert on failure
+      fetchTasks();
+    }
+  };
+
   const handleEdit = (task: Task) => {
     setEditingTask(task);
     // Scroll to form
@@ -127,6 +157,7 @@ export default function TaskList() {
                 task={task}
                 onEdit={handleEdit}
                 onDelete={handleDelete}
+                onToggleStatus={handleToggleStatus}
               />
             ))}
           </div>
