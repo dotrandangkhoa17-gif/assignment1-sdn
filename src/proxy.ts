@@ -6,7 +6,7 @@ const JWT_SECRET = new TextEncoder().encode(
   process.env.JWT_SECRET || 'taskflow-secret-key-change-in-production'
 );
 
-const protectedRoutes = ['/teams'];
+const protectedRoutes = ['/teams', '/dashboard'];
 const authRoutes = ['/login', '/register'];
 
 export async function proxy(request: NextRequest) {
@@ -26,7 +26,7 @@ export async function proxy(request: NextRequest) {
 
   // Redirect authenticated users away from auth pages
   if (isAuthenticated && authRoutes.some((route) => pathname.startsWith(route))) {
-    return NextResponse.redirect(new URL('/', request.url));
+    return NextResponse.redirect(new URL('/dashboard', request.url));
   }
 
   // Redirect unauthenticated users to login for protected routes
@@ -40,5 +40,5 @@ export async function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ['/teams/:path*', '/login', '/register'],
+  matcher: ['/teams/:path*', '/dashboard/:path*', '/login', '/register'],
 };

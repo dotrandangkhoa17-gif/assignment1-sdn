@@ -21,6 +21,7 @@ model User {
   ownedTeams    Team[]       @relation("TeamOwner")
   teamMembers   TeamMember[]
   assignedTasks Task[]       @relation("TaskAssignee")
+  createdTasks  Task[]       @relation("TaskCreator")
 }
 
 model Team {
@@ -42,8 +43,8 @@ model TeamMember {
   role     String   @default("MEMBER")
   joinedAt DateTime @default(now())
 
-  team Team @relation(fields: [teamId], references: [id])
-  user User @relation(fields: [userId], references: [id])
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([teamId, userId])
 }
@@ -55,10 +56,12 @@ model Task {
   status      String    @default("TODO")
   priority    String    @default("MEDIUM")
   dueDate     DateTime?
-  teamId      String?
+  teamId      String
   assigneeId  String?
+  creatorId   String
   createdAt   DateTime  @default(now())
 
-  team     Team? @relation(fields: [teamId], references: [id])
-  assignee User? @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  team     Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  assignee User? @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  creator  User  @relation("TaskCreator", fields: [creatorId], references: [id], onDelete: Cascade)
 }
