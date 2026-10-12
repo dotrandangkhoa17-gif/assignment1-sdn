@@ -2,9 +2,19 @@
 
 import Link from 'next/link';
 import { useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { useAuth } from '@/contexts/AuthContext';
 
 export default function Navbar() {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const { user, loading, logout } = useAuth();
+  const router = useRouter();
+
+  const handleLogout = async () => {
+    await logout();
+    router.push('/');
+    router.refresh();
+  };
 
   return (
     <nav className="navbar" id="main-navbar">
@@ -36,14 +46,61 @@ export default function Navbar() {
           >
             Home
           </Link>
-          <Link
-            href="/teams"
-            className="navbar-link"
-            id="nav-teams"
-            onClick={() => setIsMenuOpen(false)}
-          >
-            Teams
-          </Link>
+
+          {!loading && user && (
+            <>
+              <Link
+                href="/dashboard"
+                className="navbar-link"
+                id="nav-dashboard"
+                onClick={() => setIsMenuOpen(false)}
+              >
+                Dashboard
+              </Link>
+              <Link
+                href="/teams"
+                className="navbar-link"
+                id="nav-teams"
+                onClick={() => setIsMenuOpen(false)}
+              >
+                Teams
+              </Link>
+              <div className="navbar-user" id="navbar-user">
+                <div className="navbar-avatar" id="navbar-avatar">
+                  {user.name.charAt(0).toUpperCase()}
+                </div>
+                <span className="navbar-username">{user.name}</span>
+                <button
+                  className="navbar-logout-btn"
+                  id="navbar-logout"
+                  onClick={handleLogout}
+                >
+                  Sign Out
+                </button>
+              </div>
+            </>
+          )}
+
+          {!loading && !user && (
+            <div className="navbar-auth-links" id="navbar-auth-links">
+              <Link
+                href="/login"
+                className="navbar-link"
+                id="nav-login"
+                onClick={() => setIsMenuOpen(false)}
+              >
+                Sign In
+              </Link>
+              <Link
+                href="/register"
+                className="navbar-link navbar-register-btn"
+                id="nav-register"
+                onClick={() => setIsMenuOpen(false)}
+              >
+                Get Started
+              </Link>
+            </div>
+          )}
         </div>
       </div>
     </nav>
