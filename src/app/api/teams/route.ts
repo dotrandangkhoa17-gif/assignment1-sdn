@@ -85,7 +85,7 @@ export async function POST(request: Request) {
   } catch (error) {
     console.error('Error creating team:', error);
     return NextResponse.json(
-      { error: 'Failed to create team' },
+      { error: error instanceof Error ? error.message : 'Failed to create team' },
       { status: 500 }
     );
   }
