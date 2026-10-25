@@ -126,6 +126,8 @@ export default function TeamDetailContent() {
 
   // Drag state for Kanban
   const [draggedTask, setDraggedTask] = useState<string | null>(null);
+  const draggedTaskIdRef = useRef<string | null>(null);
+  const pendingTaskUpdatesRef = useRef<Map<string, string>>(new Map());
 
   const channelRef = useRef<RealtimeChannel | null>(null);
   const editingTeamRef = useRef(editingTeam);
@@ -171,13 +173,23 @@ export default function TeamDetailContent() {
       const data: Team = await res.json();
       setTeam((prev) => {
         if (!prev) return data;
-        const tasksChanged = JSON.stringify(prev.tasks) !== JSON.stringify(data.tasks);
+        // Merge pending local updates so stale server responses during in-flight network requests do not revert the optimistic state!
+        const mergedTasks = data.tasks.map((task) => {
+          const pendingStatus = pendingTaskUpdatesRef.current.get(task.id);
+          if (pendingStatus) {
+            return { ...task, status: pendingStatus };
+          }
+          return task;
+        });
+
+        const tasksChanged = JSON.stringify(prev.tasks) !== JSON.stringify(mergedTasks);
         const membersChanged = JSON.stringify(prev.members) !== JSON.stringify(data.members);
         const metaChanged = prev.name !== data.name || prev.description !== data.description;
         if (tasksChanged || membersChanged || metaChanged) {
           return {
             ...prev,
             ...data,
+            tasks: mergedTasks,
           };
         }
         return prev;
@@ -382,15 +394,28 @@ export default function TeamDetailContent() {
 
       const savedTask = await res.json();
 
-      // Realtime Broadcast
+      // Realtime Broadcast & Instant UI Update
       if (editingTask) {
+        setTeam((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            tasks: prev.tasks.map((t) => (t.id === savedTask.id ? savedTask : t)),
+          };
+        });
         broadcastTeamEvent('task-updated', savedTask);
       } else {
+        setTeam((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            tasks: [savedTask, ...prev.tasks.filter((t) => t.id !== savedTask.id)],
+          };
+        });
         broadcastTeamEvent('task-created', savedTask);
       }
 
       closeTaskForm();
-      fetchTeam();
     } catch (err) {
       setTaskError(err instanceof Error ? err.message : 'Something went wrong');
     } finally {
@@ -432,21 +457,25 @@ export default function TeamDetailContent() {
 
   const handleStatusChange = async (taskId: string, newStatus: string) => {
     const targetTask = team?.tasks.find((t) => t.id === taskId);
-    if (targetTask && !canEditTask(targetTask)) {
+    if (!targetTask) return;
+    if (targetTask.status === newStatus) return;
+
+    if (!canEditTask(targetTask)) {
       alert('You do not have permission to update the status of this task.');
       return;
     }
 
-    // Optimistic local update
-    let updatedTaskObj: Task | null = null;
+    // Lock pending update so background polling will not revert it
+    pendingTaskUpdatesRef.current.set(taskId, newStatus);
+
+    // Optimistic local update (instant 0ms)
     setTeam((prev) => {
       if (!prev) return prev;
       return {
         ...prev,
         tasks: prev.tasks.map((t) => {
           if (t.id === taskId) {
-            updatedTaskObj = { ...t, status: newStatus };
-            return updatedTaskObj;
+            return { ...t, status: newStatus };
           }
           return t;
         }),
@@ -459,25 +488,33 @@ export default function TeamDetailContent() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: newStatus }),
       });
-      if (!res.ok) throw new Error('Failed to update status');
+      if (!res.ok) {
+        throw new Error('Failed to update status');
+      }
 
       const data = await res.json();
+      pendingTaskUpdatesRef.current.delete(taskId);
       broadcastTeamEvent('task-updated', data);
     } catch {
-      fetchTeam(); // Revert on failure
+      pendingTaskUpdatesRef.current.delete(taskId);
+      fetchTeam(false); // Revert on failure
     }
   };
 
   // Drag and drop handlers for Kanban
-  const handleDragStart = (task: Task) => {
+  const handleDragStart = (e: React.DragEvent, task: Task) => {
     if (!canEditTask(task)) {
       return;
     }
+    e.dataTransfer.setData('text/plain', task.id);
+    e.dataTransfer.effectAllowed = 'move';
+    draggedTaskIdRef.current = task.id;
     setDraggedTask(task.id);
   };
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
     e.currentTarget.classList.add('drag-over');
   };
 
@@ -488,10 +525,20 @@ export default function TeamDetailContent() {
   const handleDrop = (e: React.DragEvent, newStatus: string) => {
     e.preventDefault();
     e.currentTarget.classList.remove('drag-over');
-    if (draggedTask) {
-      handleStatusChange(draggedTask, newStatus);
-      setDraggedTask(null);
+    const taskId =
+      e.dataTransfer.getData('text/plain') ||
+      draggedTaskIdRef.current ||
+      draggedTask;
+    if (taskId) {
+      handleStatusChange(taskId, newStatus);
     }
+    draggedTaskIdRef.current = null;
+    setDraggedTask(null);
+  };
+
+  const handleDragEnd = () => {
+    draggedTaskIdRef.current = null;
+    setDraggedTask(null);
   };
 
   // Member actions
@@ -905,8 +952,8 @@ export default function TeamDetailContent() {
                               } ${!userCanEdit ? 'card-view-only' : ''}`}
                               id={`kanban-task-${task.id}`}
                               draggable={userCanEdit}
-                              onDragStart={() => handleDragStart(task)}
-                              onDragEnd={() => setDraggedTask(null)}
+                              onDragStart={(e) => handleDragStart(e, task)}
+                              onDragEnd={handleDragEnd}
                             >
                               <div className="kanban-card-header">
                                 <h4 className="kanban-card-title">
@@ -961,6 +1008,23 @@ export default function TeamDetailContent() {
                                   <span className="task-badge task-due-date">
                                     📅 {formatDate(task.dueDate)}
                                   </span>
+                                )}
+                                {userCanEdit && (
+                                  <select
+                                    className="card-quick-status"
+                                    value={task.status}
+                                    onChange={(e) =>
+                                      handleStatusChange(task.id, e.target.value)
+                                    }
+                                    onClick={(e) => e.stopPropagation()}
+                                    title="Quick status change"
+                                  >
+                                    {STATUS_COLUMNS.map((s) => (
+                                      <option key={s.key} value={s.key}>
+                                        {s.icon} {s.label}
+                                      </option>
+                                    ))}
+                                  </select>
                                 )}
                               </div>
                               <div className="kanban-card-footer">

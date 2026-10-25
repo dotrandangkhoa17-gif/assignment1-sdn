@@ -1760,6 +1760,34 @@ body {
   padding: 0.15rem 0.5rem;
 }
 
+.card-quick-status {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 99px;
+  padding: 0.15rem 0.5rem;
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 600;
+  cursor: pointer;
+  outline: none;
+  transition: all 0.2s;
+  margin-left: auto;
+}
+
+.card-quick-status:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(99, 102, 241, 0.5);
+}
+
+.card-quick-status:focus {
+  border-color: #6366f1;
+}
+
+.card-quick-status option {
+  background: #121226;
+  color: #fff;
+}
+
 .kanban-card-assignee {
   display: flex;
   align-items: center;
