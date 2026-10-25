@@ -1,9 +1,13 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
-import { useParams, useRouter } from 'next/navigation';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import type { RealtimeChannel } from '@supabase/supabase-js';
+import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/contexts/AuthContext';
+import { getSupabaseClient } from '@/lib/supabase';
+import TeamChat from '@/components/TeamChat';
+import TeamActivityLog from '@/components/TeamActivityLog';
 
 interface Member {
   id: string;
@@ -38,7 +42,7 @@ interface Team {
 }
 
 type ViewMode = 'list' | 'board';
-type ActiveTab = 'tasks' | 'members' | 'settings';
+type ActiveTab = 'tasks' | 'chat' | 'members' | 'activity' | 'settings';
 
 const STATUS_COLUMNS = [
   { key: 'TODO', label: 'To Do', icon: '📋', color: 'status-todo' },
@@ -73,7 +77,21 @@ export default function TeamDetailContent() {
 
   const [team, setTeam] = useState<Team | null>(null);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<ActiveTab>('tasks');
+  const searchParams = useSearchParams();
+  const tabFromQuery = searchParams.get('tab') as ActiveTab | null;
+  const [activeTab, setActiveTab] = useState<ActiveTab>(
+    tabFromQuery && ['tasks', 'chat', 'members', 'activity', 'settings'].includes(tabFromQuery)
+      ? tabFromQuery
+      : 'tasks'
+  );
+
+  useEffect(() => {
+    const t = searchParams.get('tab') as ActiveTab | null;
+    if (t && ['tasks', 'chat', 'members', 'activity', 'settings'].includes(t)) {
+      setActiveTab(t);
+    }
+  }, [searchParams]);
+
   const [viewMode, setViewMode] = useState<ViewMode>('board');
 
   // Task form state
@@ -90,6 +108,7 @@ export default function TeamDetailContent() {
 
   // Member form state
   const [memberEmail, setMemberEmail] = useState('');
+  const [memberRoleToAdd, setMemberRoleToAdd] = useState('MEMBER');
   const [addingMember, setAddingMember] = useState(false);
   const [memberError, setMemberError] = useState('');
   const [memberSuccess, setMemberSuccess] = useState('');
@@ -108,7 +127,38 @@ export default function TeamDetailContent() {
   // Drag state for Kanban
   const [draggedTask, setDraggedTask] = useState<string | null>(null);
 
-  const fetchTeam = useCallback(async () => {
+  const channelRef = useRef<RealtimeChannel | null>(null);
+  const editingTeamRef = useRef(editingTeam);
+  useEffect(() => {
+    editingTeamRef.current = editingTeam;
+  }, [editingTeam]);
+
+  // Realtime helper to broadcast task board changes to other users
+  const broadcastTeamEvent = useCallback((event: string, payload: unknown) => {
+    if (channelRef.current) {
+      try {
+        channelRef.current.send({
+          type: 'broadcast',
+          event,
+          payload,
+        });
+        return;
+      } catch (err) {
+        console.warn('Realtime send error, falling back:', err);
+      }
+    }
+    const supabase = getSupabaseClient();
+    if (supabase && id) {
+      const channelName = `realtime-team-${id}`;
+      supabase.channel(channelName).send({
+        type: 'broadcast',
+        event,
+        payload,
+      });
+    }
+  }, [id]);
+
+  const fetchTeam = useCallback(async (isInitial = false) => {
     try {
       const res = await fetch(`/api/teams/${id}`);
       if (!res.ok) {
@@ -118,26 +168,156 @@ export default function TeamDetailContent() {
         }
         throw new Error('Failed to fetch team');
       }
-      const data = await res.json();
-      setTeam(data);
-      setEditName(data.name);
-      setEditDesc(data.description || '');
+      const data: Team = await res.json();
+      setTeam((prev) => {
+        if (!prev) return data;
+        const tasksChanged = JSON.stringify(prev.tasks) !== JSON.stringify(data.tasks);
+        const membersChanged = JSON.stringify(prev.members) !== JSON.stringify(data.members);
+        const metaChanged = prev.name !== data.name || prev.description !== data.description;
+        if (tasksChanged || membersChanged || metaChanged) {
+          return {
+            ...prev,
+            ...data,
+          };
+        }
+        return prev;
+      });
+
+      if (isInitial || !editingTeamRef.current) {
+        setEditName(data.name);
+        setEditDesc(data.description || '');
+      }
     } catch (error) {
       console.error('Error fetching team:', error);
     } finally {
-      setLoading(false);
+      if (isInitial) {
+        setLoading(false);
+      }
     }
   }, [id, router]);
 
+  // Real-time synchronization for live task board & members (Requirement 2.2)
   useEffect(() => {
-    fetchTeam();
-  }, [fetchTeam]);
+    if (!id) return;
 
-  const isOwner = team?.ownerId === user?.id;
+    // Initial load
+    fetchTeam(true);
+
+    // Live background polling fallback (every 2.5s) to guarantee live sync across all browsers
+    const interval = setInterval(() => {
+      fetchTeam(false);
+    }, 2500);
+
+    const handleFocus = () => {
+      fetchTeam(false);
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        fetchTeam(false);
+      }
+    };
+
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
+
+    // Supabase Realtime channel subscription for instant sub-100ms updates
+    const supabase = getSupabaseClient();
+    if (supabase) {
+      const channelName = `realtime-team-${id}`;
+      const channel = supabase.channel(channelName);
+      channelRef.current = channel;
+
+      channel
+        .on('broadcast', { event: 'task-created' }, (payload) => {
+          const newTask = payload?.payload as Task;
+          if (newTask) {
+            setTeam((prev) => {
+              if (!prev) return prev;
+              if (prev.tasks.some((t) => t.id === newTask.id)) return prev;
+              return {
+                ...prev,
+                tasks: [newTask, ...prev.tasks],
+              };
+            });
+          } else {
+            fetchTeam(false);
+          }
+        })
+        .on('broadcast', { event: 'task-updated' }, (payload) => {
+          const updatedTask = payload?.payload as Task;
+          if (updatedTask) {
+            setTeam((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                tasks: prev.tasks.map((t) => (t.id === updatedTask.id ? updatedTask : t)),
+              };
+            });
+          } else {
+            fetchTeam(false);
+          }
+        })
+        .on('broadcast', { event: 'task-deleted' }, (payload) => {
+          const { taskId } = (payload?.payload as { taskId: string }) || {};
+          if (taskId) {
+            setTeam((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                tasks: prev.tasks.filter((t) => t.id !== taskId),
+              };
+            });
+          } else {
+            fetchTeam(false);
+          }
+        })
+        .on('broadcast', { event: 'member-updated' }, () => {
+          fetchTeam(false);
+        })
+        .subscribe();
+    }
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      if (supabase && channelRef.current) {
+        supabase.removeChannel(channelRef.current);
+        channelRef.current = null;
+      }
+    };
+  }, [id, fetchTeam]);
+
+  // Determine current user's role in this team
+  const userMembership = team?.members.find((m) => m.userId === user?.id);
+  const currentUserRole: 'OWNER' | 'ADMIN' | 'MEMBER' =
+    team?.ownerId === user?.id
+      ? 'OWNER'
+      : (userMembership?.role as 'ADMIN' | 'MEMBER') || 'MEMBER';
+
+  const isOwner = currentUserRole === 'OWNER';
+  const isAdmin = currentUserRole === 'ADMIN';
+  const isOwnerOrAdmin = isOwner || isAdmin;
+
+  // Role permissions checking
+  const canEditTask = (task: Task) => {
+    if (isOwnerOrAdmin) return true;
+    return task.creatorId === user?.id || task.assigneeId === user?.id;
+  };
+
+  const canDeleteTask = (task: Task) => {
+    if (isOwnerOrAdmin) return true;
+    return task.creatorId === user?.id;
+  };
 
   // Task actions
   const openTaskForm = (task?: Task) => {
     if (task) {
+      if (!canEditTask(task)) {
+        alert('You do not have permission to edit this task. Only task creator/assignee, admins, and owners can edit.');
+        return;
+      }
       setEditingTask(task);
       setTaskTitle(task.title);
       setTaskDesc(task.description || '');
@@ -200,6 +380,15 @@ export default function TeamDetailContent() {
         throw new Error(errorMsg);
       }
 
+      const savedTask = await res.json();
+
+      // Realtime Broadcast
+      if (editingTask) {
+        broadcastTeamEvent('task-updated', savedTask);
+      } else {
+        broadcastTeamEvent('task-created', savedTask);
+      }
+
       closeTaskForm();
       fetchTeam();
     } catch (err) {
@@ -210,6 +399,12 @@ export default function TeamDetailContent() {
   };
 
   const handleDeleteTask = async (taskId: string) => {
+    const taskToDelete = team?.tasks.find((t) => t.id === taskId);
+    if (taskToDelete && !canDeleteTask(taskToDelete)) {
+      alert('You can only delete tasks you created. Owners and Admins can delete any task.');
+      return;
+    }
+
     if (!confirm('Are you sure you want to delete this task?')) return;
 
     try {
@@ -218,6 +413,17 @@ export default function TeamDetailContent() {
         const errorMsg = await parseErrorResponse(res, 'Failed to delete task');
         throw new Error(errorMsg);
       }
+
+      // Optimistic update + Realtime broadcast
+      setTeam((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          tasks: prev.tasks.filter((t) => t.id !== taskId),
+        };
+      });
+
+      broadcastTeamEvent('task-deleted', { taskId });
       fetchTeam();
     } catch (err) {
       alert(err instanceof Error ? err.message : 'Failed to delete task');
@@ -225,14 +431,25 @@ export default function TeamDetailContent() {
   };
 
   const handleStatusChange = async (taskId: string, newStatus: string) => {
-    // Optimistic update
+    const targetTask = team?.tasks.find((t) => t.id === taskId);
+    if (targetTask && !canEditTask(targetTask)) {
+      alert('You do not have permission to update the status of this task.');
+      return;
+    }
+
+    // Optimistic local update
+    let updatedTaskObj: Task | null = null;
     setTeam((prev) => {
       if (!prev) return prev;
       return {
         ...prev,
-        tasks: prev.tasks.map((t) =>
-          t.id === taskId ? { ...t, status: newStatus } : t
-        ),
+        tasks: prev.tasks.map((t) => {
+          if (t.id === taskId) {
+            updatedTaskObj = { ...t, status: newStatus };
+            return updatedTaskObj;
+          }
+          return t;
+        }),
       };
     });
 
@@ -243,14 +460,20 @@ export default function TeamDetailContent() {
         body: JSON.stringify({ status: newStatus }),
       });
       if (!res.ok) throw new Error('Failed to update status');
+
+      const data = await res.json();
+      broadcastTeamEvent('task-updated', data);
     } catch {
       fetchTeam(); // Revert on failure
     }
   };
 
   // Drag and drop handlers for Kanban
-  const handleDragStart = (taskId: string) => {
-    setDraggedTask(taskId);
+  const handleDragStart = (task: Task) => {
+    if (!canEditTask(task)) {
+      return;
+    }
+    setDraggedTask(task.id);
   };
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -287,7 +510,10 @@ export default function TeamDetailContent() {
       const res = await fetch(`/api/teams/${id}/members`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: memberEmail.trim() }),
+        body: JSON.stringify({
+          email: memberEmail.trim(),
+          role: memberRoleToAdd,
+        }),
       });
 
       if (!res.ok) {
@@ -298,6 +524,7 @@ export default function TeamDetailContent() {
       const data = await res.json();
       setMemberEmail('');
       setMemberSuccess(`${data.user.name} has been added to the team!`);
+      broadcastTeamEvent('member-updated', {});
       fetchTeam();
       setTimeout(() => setMemberSuccess(''), 3000);
     } catch (err) {
@@ -319,6 +546,7 @@ export default function TeamDetailContent() {
         const errorMsg = await parseErrorResponse(res, 'Failed to remove member');
         throw new Error(errorMsg);
       }
+      broadcastTeamEvent('member-updated', {});
       fetchTeam();
     } catch (err) {
       alert(err instanceof Error ? err.message : 'Failed to remove member');
@@ -336,6 +564,7 @@ export default function TeamDetailContent() {
         const errorMsg = await parseErrorResponse(res, 'Failed to update role');
         throw new Error(errorMsg);
       }
+      broadcastTeamEvent('member-updated', {});
       fetchTeam();
     } catch (err) {
       alert(err instanceof Error ? err.message : 'Failed to update role');
@@ -353,6 +582,7 @@ export default function TeamDetailContent() {
         const errorMsg = await parseErrorResponse(res, 'Failed to leave team');
         throw new Error(errorMsg);
       }
+      broadcastTeamEvent('member-updated', {});
       router.push('/teams');
     } catch (err) {
       alert(err instanceof Error ? err.message : 'Failed to leave team');
@@ -395,7 +625,7 @@ export default function TeamDetailContent() {
   const handleDeleteTeam = async () => {
     if (
       !confirm(
-        'Are you sure you want to delete this team? All tasks will be permanently deleted.'
+        'Are you sure you want to delete this team? All tasks and chat messages will be permanently deleted.'
       )
     )
       return;
@@ -433,14 +663,6 @@ export default function TeamDetailContent() {
       month: 'short',
       day: 'numeric',
     });
-  };
-
-  const canDeleteTask = (task: Task) => {
-    return (
-      task.creatorId === user?.id ||
-      task.assigneeId === user?.id ||
-      team?.ownerId === user?.id
-    );
   };
 
   if (loading) {
@@ -487,10 +709,20 @@ export default function TeamDetailContent() {
         {/* Team Header */}
         <div className="team-detail-header" id="team-detail-header">
           <div className="team-detail-info">
-            <h1 className="team-detail-name">{team.name}</h1>
+            <div className="team-name-row">
+              <h1 className="team-detail-name">{team.name}</h1>
+              {/* Role badge */}
+              <span className={`role-pill-badge role-${currentUserRole.toLowerCase()}`}>
+                {currentUserRole === 'OWNER' && '👑 Owner'}
+                {currentUserRole === 'ADMIN' && '🛡️ Admin'}
+                {currentUserRole === 'MEMBER' && '👤 Member'}
+              </span>
+            </div>
+
             {team.description && (
               <p className="team-detail-desc">{team.description}</p>
             )}
+
             <div className="team-detail-meta">
               <span>
                 Created by <strong>{team.owner.name}</strong>
@@ -501,16 +733,43 @@ export default function TeamDetailContent() {
               <span>{team.tasks.length} tasks</span>
             </div>
           </div>
+
+          {/* Visual Role Permission Description (Requirement 2.4 & Section 3) */}
+          <div className="role-permission-card" id="user-role-permission-card">
+            <div className="role-permission-header">
+              <span className="role-permission-title">Your Permissions:</span>
+              <span className="role-permission-status">
+                {isOwner && 'Full Control'}
+                {isAdmin && 'Manage Members & Tasks'}
+                {!isOwnerOrAdmin && 'Manage Own Tasks'}
+              </span>
+            </div>
+            <p className="role-permission-details">
+              {isOwner &&
+                'You can manage all members & roles, delete this team, and manage/delete all tasks.'}
+              {isAdmin &&
+                'You can add/manage members and update/delete all tasks. (Cannot delete team)'}
+              {!isOwnerOrAdmin &&
+                'You can create and manage your own tasks and view all team content.'}
+            </p>
+          </div>
         </div>
 
-        {/* Tabs */}
+        {/* Navigation Tabs */}
         <div className="team-tabs" id="team-tabs">
           <button
             className={`team-tab ${activeTab === 'tasks' ? 'active' : ''}`}
             id="tab-tasks"
             onClick={() => setActiveTab('tasks')}
           >
-            📋 Tasks
+            📋 Tasks ({team.tasks.length})
+          </button>
+          <button
+            className={`team-tab ${activeTab === 'chat' ? 'active' : ''}`}
+            id="tab-chat"
+            onClick={() => setActiveTab('chat')}
+          >
+            💬 Team Chat
           </button>
           <button
             className={`team-tab ${activeTab === 'members' ? 'active' : ''}`}
@@ -518,6 +777,13 @@ export default function TeamDetailContent() {
             onClick={() => setActiveTab('members')}
           >
             👥 Members ({team.members.length})
+          </button>
+          <button
+            className={`team-tab ${activeTab === 'activity' ? 'active' : ''}`}
+            id="tab-activity"
+            onClick={() => setActiveTab('activity')}
+          >
+            📜 Activity Log
           </button>
           {isOwner && (
             <button
@@ -530,7 +796,7 @@ export default function TeamDetailContent() {
           )}
         </div>
 
-        {/* Tasks Tab */}
+        {/* 1. Tasks Tab (Live Task Board) */}
         {activeTab === 'tasks' && (
           <div className="team-tab-content" id="tasks-content">
             {/* Task Toolbar */}
@@ -550,7 +816,7 @@ export default function TeamDetailContent() {
                     onClick={() => setViewMode('board')}
                     title="Board view"
                   >
-                    ▦
+                    ▦ Kanban Board
                   </button>
                   <button
                     className={`view-btn ${viewMode === 'list' ? 'active' : ''}`}
@@ -558,7 +824,7 @@ export default function TeamDetailContent() {
                     onClick={() => setViewMode('list')}
                     title="List view"
                   >
-                    ☰
+                    ☰ Table List
                   </button>
                 </div>
               </div>
@@ -602,7 +868,7 @@ export default function TeamDetailContent() {
               </div>
             </div>
 
-            {/* Board View (Kanban) */}
+            {/* Board View (Kanban with Live Sync) */}
             {viewMode === 'board' && (
               <div className="kanban-board" id="kanban-board">
                 {STATUS_COLUMNS.map((col) => {
@@ -627,74 +893,96 @@ export default function TeamDetailContent() {
                         </span>
                       </div>
                       <div className="kanban-column-body">
-                        {columnTasks.map((task) => (
-                          <div
-                            key={task.id}
-                            className={`kanban-card ${draggedTask === task.id ? 'dragging' : ''}`}
-                            id={`kanban-task-${task.id}`}
-                            draggable
-                            onDragStart={() => handleDragStart(task.id)}
-                            onDragEnd={() => setDraggedTask(null)}
-                          >
-                            <div className="kanban-card-header">
-                              <h4 className="kanban-card-title">
-                                {task.title}
-                              </h4>
-                              <div className="kanban-card-actions">
-                                <button
-                                  className="btn-icon btn-edit"
-                                  onClick={() => openTaskForm(task)}
-                                  title="Edit"
+                        {columnTasks.map((task) => {
+                          const userCanEdit = canEditTask(task);
+                          const userCanDelete = canDeleteTask(task);
+
+                          return (
+                            <div
+                              key={task.id}
+                              className={`kanban-card ${
+                                draggedTask === task.id ? 'dragging' : ''
+                              } ${!userCanEdit ? 'card-view-only' : ''}`}
+                              id={`kanban-task-${task.id}`}
+                              draggable={userCanEdit}
+                              onDragStart={() => handleDragStart(task)}
+                              onDragEnd={() => setDraggedTask(null)}
+                            >
+                              <div className="kanban-card-header">
+                                <h4 className="kanban-card-title">
+                                  {task.title}
+                                </h4>
+                                <div className="kanban-card-actions">
+                                  {userCanEdit ? (
+                                    <button
+                                      className="btn-icon btn-edit"
+                                      onClick={() => openTaskForm(task)}
+                                      title="Edit task"
+                                    >
+                                      ✏️
+                                    </button>
+                                  ) : (
+                                    <span
+                                      className="permission-padlock"
+                                      title="You can only edit your own tasks"
+                                    >
+                                      🔒
+                                    </span>
+                                  )}
+
+                                  {userCanDelete && (
+                                    <button
+                                      className="btn-icon btn-delete"
+                                      onClick={() => handleDeleteTask(task.id)}
+                                      title="Delete task"
+                                    >
+                                      🗑️
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                              {task.description && (
+                                <p className="kanban-card-desc">
+                                  {task.description}
+                                </p>
+                              )}
+                              <div className="kanban-card-meta">
+                                <span
+                                  className={`task-badge priority-${task.priority.toLowerCase()}`}
                                 >
-                                  ✏️
-                                </button>
-                                {canDeleteTask(task) && (
-                                  <button
-                                    className="btn-icon btn-delete"
-                                    onClick={() => handleDeleteTask(task.id)}
-                                    title="Delete"
-                                  >
-                                    🗑️
-                                  </button>
+                                  {task.priority === 'HIGH'
+                                    ? '🔴'
+                                    : task.priority === 'MEDIUM'
+                                      ? '🟡'
+                                      : '🟢'}{' '}
+                                  {task.priority}
+                                </span>
+                                {task.dueDate && (
+                                  <span className="task-badge task-due-date">
+                                    📅 {formatDate(task.dueDate)}
+                                  </span>
                                 )}
                               </div>
-                            </div>
-                            {task.description && (
-                              <p className="kanban-card-desc">
-                                {task.description}
-                              </p>
-                            )}
-                            <div className="kanban-card-meta">
-                              <span
-                                className={`task-badge priority-${task.priority.toLowerCase()}`}
-                              >
-                                {task.priority === 'HIGH'
-                                  ? '🔴'
-                                  : task.priority === 'MEDIUM'
-                                    ? '🟡'
-                                    : '🟢'}{' '}
-                                {task.priority}
-                              </span>
-                              {task.dueDate && (
-                                <span className="task-badge task-due-date">
-                                  📅 {formatDate(task.dueDate)}
+                              <div className="kanban-card-footer">
+                                {task.assignee ? (
+                                  <div className="kanban-card-assignee">
+                                    <div className="mini-avatar">
+                                      {task.assignee.name.charAt(0).toUpperCase()}
+                                    </div>
+                                    <span>{task.assignee.name}</span>
+                                  </div>
+                                ) : (
+                                  <span className="unassigned-hint">Unassigned</span>
+                                )}
+                                <span className="task-creator-hint" title={`Created by ${task.creator.name}`}>
+                                  by {task.creator.name.split(' ')[0]}
                                 </span>
-                              )}
-                            </div>
-                            {task.assignee && (
-                              <div className="kanban-card-assignee">
-                                <div className="mini-avatar">
-                                  {task.assignee.name.charAt(0).toUpperCase()}
-                                </div>
-                                <span>{task.assignee.name}</span>
                               </div>
-                            )}
-                          </div>
-                        ))}
+                            </div>
+                          );
+                        })}
                         {columnTasks.length === 0 && (
-                          <div className="kanban-empty">
-                            No tasks
-                          </div>
+                          <div className="kanban-empty">No tasks in {col.label}</div>
                         )}
                       </div>
                     </div>
@@ -709,9 +997,7 @@ export default function TeamDetailContent() {
                 {filteredTasks.length === 0 ? (
                   <div className="task-empty">
                     <p className="task-empty-icon">📭</p>
-                    <p className="task-empty-text">
-                      No tasks match your filters.
-                    </p>
+                    <p className="task-empty-text">No tasks match your filters.</p>
                   </div>
                 ) : (
                   <div className="task-table-container">
@@ -722,91 +1008,110 @@ export default function TeamDetailContent() {
                           <th>Status</th>
                           <th>Priority</th>
                           <th>Assignee</th>
+                          <th>Creator</th>
                           <th>Due Date</th>
                           <th>Actions</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {filteredTasks.map((task) => (
-                          <tr key={task.id} id={`task-row-${task.id}`}>
-                            <td>
-                              <div className="task-table-title">
-                                {task.title}
-                              </div>
-                              {task.description && (
-                                <div className="task-table-desc">
-                                  {task.description}
-                                </div>
-                              )}
-                            </td>
-                            <td>
-                              <select
-                                className="inline-select"
-                                value={task.status}
-                                onChange={(e) =>
-                                  handleStatusChange(task.id, e.target.value)
-                                }
-                              >
-                                {STATUS_COLUMNS.map((s) => (
-                                  <option key={s.key} value={s.key}>
-                                    {s.icon} {s.label}
-                                  </option>
-                                ))}
-                              </select>
-                            </td>
-                            <td>
-                              <span
-                                className={`task-badge priority-${task.priority.toLowerCase()}`}
-                              >
-                                {task.priority === 'HIGH'
-                                  ? '🔴'
-                                  : task.priority === 'MEDIUM'
-                                    ? '🟡'
-                                    : '🟢'}{' '}
-                                {task.priority}
-                              </span>
-                            </td>
-                            <td>
-                              {task.assignee ? (
-                                <div className="task-table-assignee">
-                                  <div className="mini-avatar">
-                                    {task.assignee.name
-                                      .charAt(0)
-                                      .toUpperCase()}
+                        {filteredTasks.map((task) => {
+                          const userCanEdit = canEditTask(task);
+                          const userCanDelete = canDeleteTask(task);
+
+                          return (
+                            <tr key={task.id} id={`task-row-${task.id}`}>
+                              <td>
+                                <div className="task-table-title">{task.title}</div>
+                                {task.description && (
+                                  <div className="task-table-desc">
+                                    {task.description}
                                   </div>
-                                  {task.assignee.name}
-                                </div>
-                              ) : (
-                                <span className="unassigned-label">—</span>
-                              )}
-                            </td>
-                            <td>
-                              {task.dueDate
-                                ? formatDate(task.dueDate)
-                                : '—'}
-                            </td>
-                            <td>
-                              <div className="task-table-actions">
-                                <button
-                                  className="btn-icon btn-edit"
-                                  onClick={() => openTaskForm(task)}
-                                  title="Edit"
-                                >
-                                  ✏️
-                                </button>
-                                {canDeleteTask(task) && (
-                                  <button
-                                    className="btn-icon btn-delete"
-                                    onClick={() => handleDeleteTask(task.id)}
-                                    title="Delete"
-                                  >
-                                    🗑️
-                                  </button>
                                 )}
-                              </div>
-                            </td>
-                          </tr>
-                        ))}
+                              </td>
+                              <td>
+                                {userCanEdit ? (
+                                  <select
+                                    className="inline-select"
+                                    value={task.status}
+                                    onChange={(e) =>
+                                      handleStatusChange(task.id, e.target.value)
+                                    }
+                                  >
+                                    {STATUS_COLUMNS.map((s) => (
+                                      <option key={s.key} value={s.key}>
+                                        {s.icon} {s.label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                ) : (
+                                  <span className="static-status-badge">
+                                    {task.status}
+                                  </span>
+                                )}
+                              </td>
+                              <td>
+                                <span
+                                  className={`task-badge priority-${task.priority.toLowerCase()}`}
+                                >
+                                  {task.priority === 'HIGH'
+                                    ? '🔴'
+                                    : task.priority === 'MEDIUM'
+                                      ? '🟡'
+                                      : '🟢'}{' '}
+                                  {task.priority}
+                                </span>
+                              </td>
+                              <td>
+                                {task.assignee ? (
+                                  <div className="task-table-assignee">
+                                    <div className="mini-avatar">
+                                      {task.assignee.name.charAt(0).toUpperCase()}
+                                    </div>
+                                    {task.assignee.name}
+                                  </div>
+                                ) : (
+                                  <span className="unassigned-label">—</span>
+                                )}
+                              </td>
+                              <td>
+                                <span className="task-creator-cell">{task.creator.name}</span>
+                              </td>
+                              <td>
+                                {task.dueDate ? formatDate(task.dueDate) : '—'}
+                              </td>
+                              <td>
+                                <div className="task-table-actions">
+                                  {userCanEdit ? (
+                                    <button
+                                      className="btn-icon btn-edit"
+                                      onClick={() => openTaskForm(task)}
+                                      title="Edit"
+                                    >
+                                      ✏️
+                                    </button>
+                                  ) : (
+                                    <span
+                                      className="permission-padlock"
+                                      title="You can only edit your own tasks"
+                                    >
+                                      🔒
+                                    </span>
+                                  )}
+
+                                  {userCanDelete && (
+                                    <button
+                                      className="btn-icon btn-delete"
+                                      onClick={() => handleDeleteTask(task.id)}
+                                      title="Delete"
+                                    >
+                                      🗑️
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -816,16 +1121,30 @@ export default function TeamDetailContent() {
           </div>
         )}
 
-        {/* Members Tab */}
+        {/* 2. Team Chat Tab */}
+        {activeTab === 'chat' && (
+          <div className="team-tab-content" id="chat-content">
+            <TeamChat teamId={team.id} teamName={team.name} />
+          </div>
+        )}
+
+        {/* 3. Members Tab */}
         {activeTab === 'members' && (
           <div className="team-tab-content" id="members-content">
-            {isOwner && (
+            {/* Add member form - Only available to Owner and Admin */}
+            {isOwnerOrAdmin ? (
               <form
                 className="add-member-form"
                 id="add-member-form"
                 onSubmit={handleAddMember}
               >
-                <h3 className="add-member-title">➕ Add Member by Email</h3>
+                <div className="add-member-header">
+                  <h3 className="add-member-title">➕ Add Team Member</h3>
+                  <span className="member-role-authorized">
+                    Allowed for {isOwner ? '👑 Owner' : '🛡️ Admin'}
+                  </span>
+                </div>
+
                 {memberError && (
                   <div className="auth-error">
                     <span className="auth-error-icon">⚠️</span>
@@ -840,13 +1159,25 @@ export default function TeamDetailContent() {
                 <div className="add-member-row">
                   <input
                     type="email"
-                    className="form-input"
+                    className="form-input member-email-input"
                     id="member-email-input"
-                    placeholder="Enter user email address..."
+                    placeholder="Enter member email address..."
                     value={memberEmail}
                     onChange={(e) => setMemberEmail(e.target.value)}
                     required
                   />
+
+                  {isOwner && (
+                    <select
+                      className="form-select member-role-input"
+                      value={memberRoleToAdd}
+                      onChange={(e) => setMemberRoleToAdd(e.target.value)}
+                    >
+                      <option value="MEMBER">Role: Member</option>
+                      <option value="ADMIN">Role: Admin</option>
+                    </select>
+                  )}
+
                   <button
                     type="submit"
                     className="btn btn-primary"
@@ -857,72 +1188,109 @@ export default function TeamDetailContent() {
                   </button>
                 </div>
               </form>
+            ) : (
+              <div className="member-restricted-notice">
+                <span>🔒</span> Only Owners and Admins can add new members or modify roles.
+              </div>
             )}
 
             <div className="members-list" id="members-list">
-              {team.members.map((member) => (
-                <div
-                  key={member.id}
-                  className="member-card"
-                  id={`member-${member.user.id}`}
-                >
-                  <div className="member-info">
-                    <div className="member-avatar">
-                      {member.user.name.charAt(0).toUpperCase()}
+              {team.members.map((member) => {
+                const isMemberOwner = member.role === 'OWNER';
+                const isMemberAdmin = member.role === 'ADMIN';
+                const isSelf = member.user.id === user?.id;
+
+                // Can caller modify this member's role?
+                const canModifyRole =
+                  (isOwner && !isMemberOwner) ||
+                  (isAdmin && !isMemberOwner && !isMemberAdmin);
+
+                // Can caller remove this member?
+                const canRemove =
+                  (isOwner && !isSelf) ||
+                  (isAdmin && !isMemberOwner && !isMemberAdmin && !isSelf);
+
+                return (
+                  <div
+                    key={member.id}
+                    className="member-card"
+                    id={`member-${member.user.id}`}
+                  >
+                    <div className="member-info">
+                      <div className="member-avatar">
+                        {member.user.name.charAt(0).toUpperCase()}
+                      </div>
+                      <div className="member-details">
+                        <div className="member-name-row">
+                          <span className="member-name">{member.user.name}</span>
+                          {isSelf && <span className="you-badge">(You)</span>}
+                        </div>
+                        <span className="member-email">{member.user.email}</span>
+                      </div>
                     </div>
-                    <div className="member-details">
-                      <span className="member-name">{member.user.name}</span>
-                      <span className="member-email">{member.user.email}</span>
+
+                    <div className="member-actions">
+                      {isMemberOwner ? (
+                        <span className="team-role-badge owner-badge">👑 Owner</span>
+                      ) : canModifyRole ? (
+                        <select
+                          className="role-select"
+                          value={member.role}
+                          onChange={(e) =>
+                            handleRoleChange(member.user.id, e.target.value)
+                          }
+                          aria-label="Change member role"
+                        >
+                          <option value="MEMBER">👤 Member</option>
+                          <option value="ADMIN">🛡️ Admin</option>
+                        </select>
+                      ) : (
+                        <span
+                          className={`team-role-badge ${
+                            isMemberAdmin ? 'admin-badge' : 'member-badge'
+                          }`}
+                        >
+                          {isMemberAdmin ? '🛡️ Admin' : '👤 Member'}
+                        </span>
+                      )}
+
+                      {canRemove && (
+                        <button
+                          className="btn btn-danger-sm"
+                          id={`remove-member-${member.user.id}`}
+                          onClick={() =>
+                            handleRemoveMember(member.user.id, member.user.name)
+                          }
+                        >
+                          Remove
+                        </button>
+                      )}
+
+                      {!isOwner && isSelf && (
+                        <button
+                          className="btn btn-danger-sm"
+                          id="leave-team-btn"
+                          onClick={handleLeaveTeam}
+                        >
+                          Leave Team
+                        </button>
+                      )}
                     </div>
                   </div>
-                  <div className="member-actions">
-                    {member.role === 'OWNER' ? (
-                      <span className="team-role-badge owner-badge">👑 Owner</span>
-                    ) : isOwner ? (
-                      <select
-                        className="role-select"
-                        value={member.role}
-                        onChange={(e) => handleRoleChange(member.user.id, e.target.value)}
-                        aria-label="Change member role"
-                      >
-                        <option value="MEMBER">Member</option>
-                        <option value="ADMIN">Admin</option>
-                      </select>
-                    ) : (
-                      <span className="team-role-badge member-badge">
-                        {member.role === 'ADMIN' ? '🛡️ Admin' : 'Member'}
-                      </span>
-                    )}
-
-                    {isOwner && member.user.id !== user?.id && (
-                      <button
-                        className="btn btn-danger-sm"
-                        id={`remove-member-${member.user.id}`}
-                        onClick={() =>
-                          handleRemoveMember(member.user.id, member.user.name)
-                        }
-                      >
-                        Remove
-                      </button>
-                    )}
-
-                    {!isOwner && member.user.id === user?.id && (
-                      <button
-                        className="btn btn-danger-sm"
-                        id="leave-team-btn"
-                        onClick={handleLeaveTeam}
-                      >
-                        Leave Team
-                      </button>
-                    )}
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
 
-        {/* Settings Tab */}
+        {/* 4. Activity Log Tab */}
+        {activeTab === 'activity' && (
+          <div className="team-tab-content" id="activity-content">
+            <TeamActivityLog teamId={team.id} />
+          </div>
+        )}
+
+        {/* 5. Settings Tab (Owner Only) */}
         {activeTab === 'settings' && isOwner && (
           <div className="team-tab-content" id="settings-content">
             <form
@@ -975,10 +1343,9 @@ export default function TeamDetailContent() {
             </form>
 
             <div className="danger-zone" id="danger-zone">
-              <h3 className="danger-zone-title">🚨 Danger Zone</h3>
+              <h3 className="danger-zone-title">🚨 Danger Zone (Owner Only)</h3>
               <p className="danger-zone-text">
-                Deleting this team will permanently remove all tasks and member
-                associations. This action cannot be undone.
+                Deleting this team will permanently remove all tasks, chat messages, and member associations. This action cannot be undone.
               </p>
               <button
                 className="btn btn-danger"
@@ -1107,7 +1474,7 @@ export default function TeamDetailContent() {
                       <option value="">Unassigned</option>
                       {team.members.map((m) => (
                         <option key={m.user.id} value={m.user.id}>
-                          {m.user.name}
+                          {m.user.name} ({m.user.email})
                         </option>
                       ))}
                     </select>

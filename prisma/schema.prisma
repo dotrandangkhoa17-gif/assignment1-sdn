@@ -18,10 +18,13 @@ model User {
   hashedPassword String
   createdAt      DateTime     @default(now())
 
-  ownedTeams    Team[]       @relation("TeamOwner")
+  ownedTeams    Team[]         @relation("TeamOwner")
   teamMembers   TeamMember[]
-  assignedTasks Task[]       @relation("TaskAssignee")
-  createdTasks  Task[]       @relation("TaskCreator")
+  assignedTasks Task[]         @relation("TaskAssignee")
+  createdTasks  Task[]         @relation("TaskCreator")
+  messages      Message[]
+  notifications Notification[]
+  activityLogs  ActivityLog[]
 }
 
 model Team {
@@ -31,9 +34,11 @@ model Team {
   ownerId     String
   createdAt   DateTime     @default(now())
 
-  owner   User         @relation("TeamOwner", fields: [ownerId], references: [id])
-  members TeamMember[]
-  tasks   Task[]
+  owner        User          @relation("TeamOwner", fields: [ownerId], references: [id])
+  members      TeamMember[]
+  tasks        Task[]
+  messages     Message[]
+  activityLogs ActivityLog[]
 }
 
 model TeamMember {
@@ -65,3 +70,43 @@ model Task {
   assignee User? @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
   creator  User  @relation("TaskCreator", fields: [creatorId], references: [id], onDelete: Cascade)
 }
+
+model Message {
+  id             String   @id @default(cuid())
+  content        String
+  attachmentUrl  String?
+  attachmentType String?  // 'IMAGE' | 'FILE'
+  attachmentName String?
+  teamId         String
+  senderId       String
+  createdAt      DateTime @default(now())
+
+  team   Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  sender User @relation(fields: [senderId], references: [id], onDelete: Cascade)
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String
+  message   String
+  type      String   // 'TASK_ASSIGNED' | 'TEAM_INVITE' | 'TASK_STATUS_CHANGED' | 'ROLE_UPDATED'
+  link      String?
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model ActivityLog {
+  id        String   @id @default(cuid())
+  teamId    String
+  userId    String
+  action    String   // 'CREATE_TASK' | 'UPDATE_TASK' | 'DELETE_TASK' | 'ADD_MEMBER' | 'REMOVE_MEMBER' | 'UPDATE_ROLE' | 'UPDATE_TEAM'
+  details   String?
+  createdAt DateTime @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+

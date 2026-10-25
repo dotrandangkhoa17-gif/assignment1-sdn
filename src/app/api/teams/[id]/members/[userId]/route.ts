@@ -1,6 +1,9 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { canRemoveMember, canUpdateMemberRole } from '@/lib/permissions';
+import { createNotification } from '@/lib/notification';
+import { logActivity } from '@/lib/activity';
 
 // DELETE /api/teams/:id/members/:userId - Remove member or leave team
 export async function DELETE(
@@ -13,68 +16,98 @@ export async function DELETE(
       return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
     }
 
-    const { id: teamId, userId } = await params;
+    const { id: teamId, userId: targetUserId } = await params;
 
     // Check team exists
-    const team = await prisma.team.findUnique({ where: { id: teamId } });
+    const team = await prisma.team.findUnique({
+      where: { id: teamId },
+      include: {
+        members: true,
+      },
+    });
+
     if (!team) {
       return NextResponse.json({ error: 'Team not found' }, { status: 404 });
     }
 
-    const isOwner = team.ownerId === session.userId;
-    const isSelf = userId === session.userId;
+    const callerMember = team.members.find((m) => m.userId === session.userId);
+    const callerRole =
+      team.ownerId === session.userId
+        ? 'OWNER'
+        : callerMember?.role || 'MEMBER';
 
-    // Only owner can remove others, or user can remove themselves (leave team)
-    if (!isOwner && !isSelf) {
-      return NextResponse.json(
-        { error: 'You do not have permission to remove this member' },
-        { status: 403 }
-      );
-    }
-
-    // Owner cannot leave the team directly
-    if (isSelf && isOwner) {
-      return NextResponse.json(
-        { error: 'Team owner cannot leave the team. You can delete the team in Settings.' },
-        { status: 400 }
-      );
-    }
-
-    // Check member exists
-    const member = await prisma.teamMember.findUnique({
-      where: {
-        teamId_userId: {
-          teamId,
-          userId,
-        },
-      },
-    });
-
-    if (!member) {
+    const targetMember = team.members.find((m) => m.userId === targetUserId);
+    if (!targetMember) {
       return NextResponse.json(
         { error: 'User is not a member of this team' },
         { status: 404 }
       );
     }
 
+    const targetRole =
+      team.ownerId === targetUserId ? 'OWNER' : targetMember.role;
+
+    const isSelf = targetUserId === session.userId;
+
+    // Check permission
+    if (
+      !canRemoveMember(
+        callerRole,
+        session.userId,
+        targetRole,
+        targetUserId
+      )
+    ) {
+      return NextResponse.json(
+        {
+          error: isSelf && callerRole === 'OWNER'
+            ? 'Team owner cannot leave the team. You can delete the team in Settings.'
+            : 'You do not have permission to remove this member',
+        },
+        { status: 403 }
+      );
+    }
+
     // Remove member and unassign their tasks
     await prisma.$transaction([
       prisma.task.updateMany({
-        where: { teamId, assigneeId: userId },
+        where: { teamId, assigneeId: targetUserId },
         data: { assigneeId: null },
       }),
       prisma.teamMember.delete({
         where: {
           teamId_userId: {
             teamId,
-            userId,
+            userId: targetUserId,
           },
         },
       }),
     ]);
 
+    // Activity log
+    await logActivity(
+      teamId,
+      session.userId,
+      isSelf ? 'LEAVE_TEAM' : 'REMOVE_MEMBER',
+      isSelf
+        ? `${session.name} left the team`
+        : `Removed member (ID: ${targetUserId}) from the team`
+    );
+
+    // If removed by someone else, notify target user
+    if (!isSelf) {
+      await createNotification(
+        targetUserId,
+        'Removed from Team',
+        `You were removed from the team "${team.name}" by ${session.name}`,
+        'TEAM_REMOVED'
+      );
+    }
+
     return NextResponse.json({
-      message: isSelf ? 'You have left the team' : 'Member removed successfully',
+      message: isSelf
+        ? 'You have left the team'
+        : 'Member removed successfully',
     });
   } catch (error) {
     console.error('Error removing member:', error);
@@ -85,7 +118,7 @@ export async function DELETE(
   }
 }
 
-// PUT /api/teams/:id/members/:userId - Update member role (owner only)
+// PUT /api/teams/:id/members/:userId - Update member role (Owner / Admin)
 export async function PUT(
   request: Request,
   { params }: { params: Promise<{ id: string; userId: string }> }
@@ -96,17 +129,40 @@ export async function PUT(
       return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
     }
 
-    const { id: teamId, userId } = await params;
+    const { id: teamId, userId: targetUserId } = await params;
 
-    // Check team exists and user is owner
-    const team = await prisma.team.findUnique({ where: { id: teamId } });
+    // Check team exists
+    const team = await prisma.team.findUnique({
+      where: { id: teamId },
+      include: {
+        members: true,
+      },
+    });
+
     if (!team) {
       return NextResponse.json({ error: 'Team not found' }, { status: 404 });
     }
 
-    if (team.ownerId !== session.userId) {
+    const callerMember = team.members.find((m) => m.userId === session.userId);
+    const callerRole =
+      team.ownerId === session.userId
+        ? 'OWNER'
+        : callerMember?.role || 'MEMBER';
+
+    const targetMember = team.members.find((m) => m.userId === targetUserId);
+    if (!targetMember) {
       return NextResponse.json(
-        { error: 'Only the team owner can change member roles' },
+        { error: 'Target user is not a member of this team' },
+        { status: 404 }
+      );
+    }
+
+    const targetRole =
+      team.ownerId === targetUserId ? 'OWNER' : targetMember.role;
+
+    if (!canUpdateMemberRole(callerRole, targetRole)) {
+      return NextResponse.json(
+        { error: 'You do not have permission to change this member role' },
         { status: 403 }
       );
     }
@@ -125,7 +181,7 @@ export async function PUT(
       where: {
         teamId_userId: {
           teamId,
-          userId,
+          userId: targetUserId,
         },
       },
       data: { role },
@@ -133,6 +189,23 @@ export async function PUT(
         user: { select: { id: true, name: true, email: true } },
       },
     });
+
+    // In-app notification
+    await createNotification(
+      targetUserId,
+      'Role Updated',
+      `Your role in team "${team.name}" has been changed to ${role} by ${session.name}`,
+      'ROLE_UPDATED',
+      `/teams/${teamId}`
+    );
+
+    // Activity log
+    await logActivity(
+      teamId,
+      session.userId,
+      'UPDATE_ROLE',
+      `Updated ${updated.user.name}'s role to ${role}`
+    );
 
     return NextResponse.json(updated);
   } catch (error) {
@@ -143,4 +216,3 @@ export async function PUT(
     );
   }
 }
-

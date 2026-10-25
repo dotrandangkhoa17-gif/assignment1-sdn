@@ -1,8 +1,11 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { canAddMember } from '@/lib/permissions';
+import { createNotification } from '@/lib/notification';
+import { logActivity } from '@/lib/activity';
 
-// POST /api/teams/:id/members - Add member to team (owner only)
+// POST /api/teams/:id/members - Add member to team (Owner or Admin)
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -15,21 +18,36 @@ export async function POST(
 
     const { id: teamId } = await params;
 
-    // Check team exists and user is the owner
-    const team = await prisma.team.findUnique({ where: { id: teamId } });
+    // Check team exists
+    const team = await prisma.team.findUnique({
+      where: { id: teamId },
+      include: {
+        members: {
+          where: { userId: session.userId },
+        },
+      },
+    });
+
     if (!team) {
       return NextResponse.json({ error: 'Team not found' }, { status: 404 });
     }
 
-    if (team.ownerId !== session.userId) {
+    const currentMember = team.members[0];
+    const userRole =
+      team.ownerId === session.userId
+        ? 'OWNER'
+        : currentMember?.role || 'MEMBER';
+
+    // Verify permission: Only OWNER or ADMIN can add members
+    if (!canAddMember(userRole)) {
       return NextResponse.json(
-        { error: 'Only the team owner can add members' },
+        { error: 'Only team owners and admins can add members' },
         { status: 403 }
       );
     }
 
     const body = await request.json();
-    const { email } = body;
+    const { email, role = 'MEMBER' } = body;
 
     if (!email || !email.trim()) {
       return NextResponse.json(
@@ -37,6 +55,8 @@ export async function POST(
         { status: 400 }
       );
     }
+
+    const targetRole = role === 'ADMIN' && userRole === 'OWNER' ? 'ADMIN' : 'MEMBER';
 
     // Find the user by email
     const userToAdd = await prisma.user.findUnique({
@@ -72,12 +92,29 @@ export async function POST(
       data: {
         teamId,
         userId: userToAdd.id,
-        role: 'MEMBER',
+        role: targetRole,
       },
       include: {
         user: { select: { id: true, name: true, email: true } },
       },
     });
+
+    // In-App Notification (Functional Requirement 2.3)
+    await createNotification(
+      userToAdd.id,
+      'Added to Team',
+      `You were added to the team "${team.name}" by ${session.name}`,
+      'TEAM_INVITE',
+      `/teams/${teamId}`
+    );
+
+    // Audit Log (Bonus 4.3)
+    await logActivity(
+      teamId,
+      session.userId,
+      'ADD_MEMBER',
+      `Added ${userToAdd.name} (${userToAdd.email}) as ${targetRole}`
+    );
 
     return NextResponse.json(member, { status: 201 });
   } catch (error) {

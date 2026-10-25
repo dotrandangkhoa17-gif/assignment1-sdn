@@ -1,3 +1,4 @@
+import { Suspense } from 'react';
 import type { Metadata } from 'next';
 import TeamDetailContent from './TeamDetailContent';
 
@@ -7,5 +8,15 @@ export const metadata: Metadata = {
 };
 
 export default function TeamDetailPage() {
-  return <TeamDetailContent />;
+  return (
+    <Suspense
+      fallback={
+        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '60vh' }}>
+          <div className="spinner" />
+        </div>
+      }
+    >
+      <TeamDetailContent />
+    </Suspense>
+  );
 }

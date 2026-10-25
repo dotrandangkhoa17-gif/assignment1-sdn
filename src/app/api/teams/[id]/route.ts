@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { logActivity } from '@/lib/activity';
 
 // GET /api/teams/:id - Get team details with members and tasks
 export async function GET(
@@ -106,6 +107,13 @@ export async function PUT(
         _count: { select: { tasks: true } },
       },
     });
+
+    await logActivity(
+      id,
+      session.userId,
+      'UPDATE_TEAM',
+      `Updated team details (Name: "${updatedTeam.name}")`
+    );
 
     return NextResponse.json(updatedTeam);
   } catch (error) {
